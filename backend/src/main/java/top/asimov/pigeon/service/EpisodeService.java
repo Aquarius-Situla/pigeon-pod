@@ -24,6 +24,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 import top.asimov.pigeon.config.DownloadProperties;
+import top.asimov.pigeon.config.MediaPathProperties;
 import top.asimov.pigeon.config.StorageProperties;
 import top.asimov.pigeon.event.EpisodesCreatedEvent;
 import top.asimov.pigeon.exception.BusinessException;
@@ -56,12 +57,14 @@ public class EpisodeService {
   private final StorageProperties storageProperties;
   private final S3StorageService s3StorageService;
   private final DownloadProperties downloadProperties;
+  private final MediaPathProperties mediaPathProperties;
 
   public EpisodeService(EpisodeMapper episodeMapper, ApplicationEventPublisher eventPublisher,
       MessageSource messageSource, ChannelMapper channelMapper,
       PlaylistEpisodeMapper playlistEpisodeMapper, PlaylistMapper playlistMapper,
       StorageProperties storageProperties,
-      S3StorageService s3StorageService, DownloadProperties downloadProperties) {
+      S3StorageService s3StorageService, DownloadProperties downloadProperties,
+      MediaPathProperties mediaPathProperties) {
     this.episodeMapper = episodeMapper;
     this.eventPublisher = eventPublisher;
     this.messageSource = messageSource;
@@ -71,6 +74,7 @@ public class EpisodeService {
     this.storageProperties = storageProperties;
     this.s3StorageService = s3StorageService;
     this.downloadProperties = downloadProperties;
+    this.mediaPathProperties = mediaPathProperties;
   }
 
   public boolean isS3Mode() {
@@ -414,6 +418,9 @@ public class EpisodeService {
     // 删除 Podcasting 2.0 章节文件（episodeId.chapters.json）
     deleteChaptersFile(audioFilePath, episode.getId());
 
+    // 删除单集封面缓存文件
+    deleteEpisodeCoverFile(episode.getId());
+
     if (StringUtils.hasText(audioFilePath)) {
       try {
         Files.deleteIfExists(Paths.get(audioFilePath));
@@ -466,6 +473,9 @@ public class EpisodeService {
                 LocaleContextHolder.getLocale()));
       }
     }
+
+    // 删除单集封面缓存文件
+    deleteEpisodeCoverFile(id);
 
     return episodeMapper.deleteById(id);
   }
@@ -608,6 +618,39 @@ public class EpisodeService {
     }
   }
 
+  /**
+   * Deletes the episode cover cache file at {@code {coverFilePath}/episodes/{episodeId}.jpg}.
+   *
+   * <p>This file is generated on-demand by the cover service and stored separately from the
+   * media thumbnail. Removing it when the episode is deleted or its media is cleaned up
+   * prevents unbounded disk usage.
+   *
+   * @param episodeId the episode ID whose cover file should be deleted
+   */
+  void deleteEpisodeCoverFile(String episodeId) {
+    if (isS3Mode()) {
+      return;
+    }
+    if (!StringUtils.hasText(episodeId)) {
+      return;
+    }
+    try {
+      String coverBasePath = mediaPathProperties.getCoverFilePath();
+      if (!StringUtils.hasText(coverBasePath)) {
+        return;
+      }
+      Path coverFile = Paths.get(coverBasePath, "episodes", episodeId + ".jpg");
+      boolean deleted = Files.deleteIfExists(coverFile);
+      if (deleted) {
+        log.debug("[storage] episode cover file deleted: episodeId={} path={}", episodeId, coverFile);
+      }
+    } catch (Exception e) {
+      // Non-fatal: log and continue. Missing cover files should not block episode deletion.
+      log.warn("[storage] episode cover file delete failed: episodeId={} reason={}",
+          episodeId, e.getMessage(), e);
+    }
+  }
+
   public int deleteEpisodesByChannelId(String channelId) {
     LambdaQueryWrapper<Episode> wrapper = new LambdaQueryWrapper<>();
     wrapper.eq(Episode::getChannelId, channelId);
@@ -677,6 +720,9 @@ public class EpisodeService {
         throw new BusinessException(message);
       }
     }
+
+    // 删除单集封面缓存文件
+    deleteEpisodeCoverFile(persisted.getId());
 
     persisted.setMediaFilePath(null);
     persisted.setMediaSizeBytes(null);
